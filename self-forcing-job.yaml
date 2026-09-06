@@ -38,8 +38,16 @@ spec:
               RF_COMMIT="${RF_COMMIT:-0cfc734656aa0ff72438f4ba2771056f4df52807}"
 
               cd /tmp
-              git clone -b "$SF_BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/Self-Forcing.git
-              git clone https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git
+              # set +x around the clones: with -x the expanded URL puts GITHUB_TOKEN in
+              # plaintext into the pod log, where anyone with `kubectl logs` can read it.
+              set +x
+              git clone -q -b "$SF_BRANCH" "https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/Self-Forcing.git"
+              git clone -q "https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git"
+              # Drop the credential-bearing remote URLs so later git calls can't echo them.
+              git -C Self-Forcing remote set-url origin https://github.com/yahavb/Self-Forcing.git
+              git -C rolling_forcing remote set-url origin https://github.com/yahavb/rolling_forcing.git
+              set -x
+              echo "Cloned Self-Forcing ($SF_BRANCH) and rolling_forcing."
               git -C rolling_forcing checkout --detach "$RF_COMMIT"
 
               echo "┌── PROVENANCE ──"
@@ -51,8 +59,17 @@ spec:
               cd /tmp/Self-Forcing
               export PYTHONPATH=/tmp/rolling_forcing
 
-              # ─── Install deps (same set as rolling-forcing-job.yaml) ──────
-              uv pip install \
+              # ─── Install deps (same pinned set as rolling_forcing) ────────
+              # This DLC image does not auto-activate a venv, so a bare
+              # `uv pip install` dies with "No virtual environment found".
+              # Target the same interpreter python3 uses (where torch-neuronx
+              # already lives) via --python, as rolling_forcing/rf-job.yaml does.
+              # torchvision is deliberately NOT installed: nothing on the path we
+              # use needs it (utils/video.py writes mp4 through av).
+              UVPY="$(command -v python3)"
+              echo "uv target interpreter: $UVPY"
+
+              uv pip install --python "$UVPY" \
                 "diffusers==0.37.1" \
                 "transformers==5.8.1" \
                 "huggingface-hub==1.16.4" \
@@ -67,12 +84,19 @@ spec:
               python3 neuron/tests/test_schedule.py
 
               # ─── Model weights: Wan2.1-T2V-1.3B (T5 + VAE) ────────────────
-              # Shared with rolling_forcing — same backbone, same tar.
-              WAN_TAR="/var/mdl/rolling_forcing/Wan2.1-T2V-1.3B.tar"
+              # Shared with rolling_forcing — same backbone, same tar. /var/mdl is
+              # S3-backed, so one tar beats per-file reads. The trn3-dev1 jobs cache
+              # under /var/mdl/wan_models/, the trn2 job under /var/mdl/rolling_forcing/;
+              # take whichever exists, and write the trn3 path when neither does.
+              WAN_TAR="/var/mdl/wan_models/Wan2.1-T2V-1.3B.tar"
+              for cand in /var/mdl/wan_models/Wan2.1-T2V-1.3B.tar \
+                          /var/mdl/rolling_forcing/Wan2.1-T2V-1.3B.tar; do
+                if [[ -f "$cand" ]]; then WAN_TAR="$cand"; break; fi
+              done
 
+              mkdir -p wan_models
               if [[ -f "$WAN_TAR" ]]; then
-                echo "Extracting Wan2.1-T2V-1.3B from PVC cache..."
-                mkdir -p wan_models
+                echo "Extracting Wan2.1-T2V-1.3B from PVC cache ($WAN_TAR)..."
                 tar xf "$WAN_TAR" -C wan_models/
               else
                 echo "Downloading Wan2.1-T2V-1.3B from HuggingFace..."
@@ -88,23 +112,20 @@ spec:
               fi
 
               # ─── Model weights: Self-Forcing DMD checkpoint ───────────────
-              DMD_TAR="/var/mdl/self_forcing/self_forcing_dmd.tar"
+              # Single file, so cached plain (no tar) under the same /var/mdl/checkpoints/
+              # the trn3-dev1 RF jobs use.
+              SF_CACHE="/var/mdl/checkpoints/self_forcing_dmd.pt"
+              mkdir -p checkpoints
 
-              if [[ -f "$DMD_TAR" ]]; then
-                echo "Extracting Self-Forcing DMD checkpoint from PVC cache..."
-                mkdir -p checkpoints
-                tar xf "$DMD_TAR" -C checkpoints/
+              if [[ -f "$SF_CACHE" ]]; then
+                echo "Copying Self-Forcing DMD checkpoint from PVC cache..."
+                cp "$SF_CACHE" checkpoints/self_forcing_dmd.pt
               else
                 echo "Downloading Self-Forcing DMD checkpoint from HuggingFace..."
-                python3 -c "
-              from huggingface_hub import snapshot_download
-              snapshot_download('gdhe17/Self-Forcing', allow_patterns='checkpoints/self_forcing_dmd.pt', local_dir='.', local_dir_use_symlinks=False)
-              "
+                python3 -c "from huggingface_hub import hf_hub_download; hf_hub_download('gdhe17/Self-Forcing', 'checkpoints/self_forcing_dmd.pt', local_dir='.')"
                 echo "Caching to PVC..."
-                tar cf /tmp/self_forcing_dmd.tar -C checkpoints self_forcing_dmd.pt
-                mkdir -p "$(dirname $DMD_TAR)"
-                cp /tmp/self_forcing_dmd.tar "$DMD_TAR"
-                rm -f /tmp/self_forcing_dmd.tar
+                mkdir -p "$(dirname $SF_CACHE)"
+                cp checkpoints/self_forcing_dmd.pt "$SF_CACHE"
               fi
 
               ls -la wan_models/Wan2.1-T2V-1.3B/ checkpoints/
