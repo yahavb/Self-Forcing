@@ -78,7 +78,8 @@ spec:
                 "omegaconf==2.3.0" \
                 "ftfy==6.3.1" \
                 "regex==2026.5.9" \
-                "av==17.0.1"
+                "av==17.0.1" \
+                "Pillow"
 
               # ─── Schedule gate: cheap, catches a bad port before the device ──
               python3 neuron/tests/test_schedule.py
@@ -158,9 +159,16 @@ spec:
               echo "============================================"
               mkdir -p "$ARCHIVE_DIR"
               cp videos_sf/*.mp4 "$ARCHIVE_DIR/" 2>/dev/null || true
+              # Per-frame PNGs, so the frames can be inspected without decoding the mp4.
+              if [[ -d videos_sf/frames ]]; then
+                cp -r videos_sf/frames "$ARCHIVE_DIR/frames"
+              fi
               git -C /tmp/Self-Forcing rev-parse HEAD > "$ARCHIVE_DIR/self_forcing.sha"
               git -C /tmp/rolling_forcing rev-parse HEAD > "$ARCHIVE_DIR/rolling_forcing.sha"
+              echo "--- archive contents ---"
               ls -la "$ARCHIVE_DIR/"
+              find "$ARCHIVE_DIR/frames" -name '*.png' 2>/dev/null | wc -l | xargs echo "PNG frames archived:"
+              du -sh "$ARCHIVE_DIR"
 
               echo "═══════════════════════════════════════════"
               echo "  Done! Self-Forcing inference complete"
@@ -243,6 +251,10 @@ spec:
             # for the NaN band and a working fallback if the sharded path is broken.
             - name: SF_VAE_SHARD
               value: "none"
+            # One PNG per frame in videos_sf/frames/prompt_NNN/, archived to the PVC
+            # alongside the mp4.
+            - name: SF_SAVE_FRAMES
+              value: "1"
             # CONFIG_PATH and LATENT_W must agree: fs1560 <-> 104 (480x832, native),
             # fs1200 <-> 80 (480x640, the width every RF trn3 job runs).
             - name: CONFIG_PATH

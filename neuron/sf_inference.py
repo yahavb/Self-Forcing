@@ -16,6 +16,7 @@ divisible by 8 but not 16, and the SP shard may not split a frame.
 import argparse
 import os
 import sys
+import tempfile
 import time
 
 import torch
@@ -34,7 +35,7 @@ from models.vae import build_vae, destroy_vae_parallel_group, init_vae_parallel_
 from utils import parallel_state as ps
 from utils import w_shard
 from utils.logging_utils import configure_logging, get_logger
-from utils.video import gather_and_save, save_video
+from utils.video import save_video, video_tensor_to_uint8
 
 from pipeline_self_forcing import build_sf_pipeline, probe
 
@@ -64,6 +65,54 @@ def init_vae_group(rank, world):
 def vae_input(latent, rank, world):
     """The latent this rank feeds the decoder: its W shard, or the whole thing."""
     return latent if VAE_SHARD == "none" else w_shard(latent, rank, world)
+
+
+# Write every frame as a PNG next to the mp4. Pillow is installed explicitly by the
+# job rather than relied on as a transitive dep.
+SAVE_FRAMES = os.environ.get("SF_SAVE_FRAMES", "1") == "1"
+
+
+def gather_full_video(video_local, rank, world):
+    """The whole frame on rank 0, None elsewhere.
+
+    Unsharded, this rank already decoded full width. Sharded, the W shards go
+    through files exactly as rolling_forcing's utils.video.gather_and_save does --
+    these are CPU tensors and that is the idiom that stack uses for them.
+    """
+    if VAE_SHARD == "none":
+        return video_local if rank == 0 else None
+
+    scratch = os.path.join(tempfile.gettempdir(), "sf_vae_shards")
+    if rank == 0:
+        os.makedirs(scratch, exist_ok=True)
+    dist.barrier()
+    torch.save(video_local, os.path.join(scratch, f"shard_rank{rank}.pt"))
+    dist.barrier()
+
+    full = None
+    if rank == 0:
+        full = torch.cat(
+            [torch.load(os.path.join(scratch, f"shard_rank{r}.pt"), map_location="cpu")
+             for r in range(world)], dim=-1)
+    dist.barrier()
+    if rank == 0:
+        for r in range(world):
+            os.remove(os.path.join(scratch, f"shard_rank{r}.pt"))
+        os.rmdir(scratch)
+    return full
+
+
+def save_frames(video, out_dir):
+    """One PNG per frame. video is [B,T,C,H,W] in [-1,1]; video_tensor_to_uint8
+    returns [B,T,H,W,C] uint8, which is already PIL's RGB layout."""
+    from PIL import Image
+
+    os.makedirs(out_dir, exist_ok=True)
+    frames = video_tensor_to_uint8(video)[0]
+    for i, frame in enumerate(frames):
+        Image.fromarray(frame.numpy()).save(
+            os.path.join(out_dir, f"frame_{i:04d}.png"))
+    logger.info("  wrote %d frames to %s", frames.shape[0], out_dir)
 
 
 configure_logging()
@@ -233,14 +282,14 @@ def main():
                 raise AssertionError(msg)
             logger.warning("%s (continuing: SF_DEBUG_NUMERICS=1)", msg)
 
-        out_path = os.path.join(args.output_folder, f"prompt_{prompt_idx:03d}.mp4")
-        if VAE_SHARD == "none":
-            # Every rank decoded the full width, so there is nothing to concatenate.
-            if rank == 0:
-                save_video(video_local, out_path, args.fps)
-            dist.barrier()
-        else:
-            gather_and_save(video_local, out_path, args.fps, rank, world)
+        full = gather_full_video(video_local, rank, world)
+        if rank == 0:
+            out_path = os.path.join(args.output_folder, f"prompt_{prompt_idx:03d}.mp4")
+            save_video(full, out_path, args.fps)
+            if SAVE_FRAMES:
+                save_frames(full, os.path.join(
+                    args.output_folder, "frames", f"prompt_{prompt_idx:03d}"))
+        dist.barrier()
 
     destroy_t5_parallel_group()
     destroy_parallel_groups()
