@@ -39,7 +39,9 @@ neuron/
   pipeline_self_forcing.py       # SelfForcingInferencePipeline + build_sf_pipeline
   sf_inference.py                # torchrun entry point
   configs/self_forcing_dmd.yaml  # 4-step schedule, frame_seq_length 1560
-  jobs/self-forcing-job.yaml     # k8s Job for node-type trn3-dev1
+
+self-forcing-job.yaml            # k8s Job, at the repo root next to the other
+                                 # job specs (rolling_forcing convention)
 ```
 
 ## Running
@@ -47,7 +49,7 @@ neuron/
 On the cluster:
 
 ```bash
-kubectl apply -f neuron/jobs/self-forcing-job.yaml
+kubectl apply -f self-forcing-job.yaml
 kubectl logs -f job/self-forcing
 ```
 
