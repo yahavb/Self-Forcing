@@ -261,11 +261,17 @@ spec:
               value: "134217728"
             - name: USE_NKI_KERNELS
               value: "true"
-            # 0, matching the only configuration that has ever produced a good video.
-            # See the compile-caching note above: this is the last env difference
-            # between that run and the two that failed to compile the VAE.
+            # Back to 1, and this time for a reason that holds: every failure with it
+            # on was on the UNSHARDED path, which is now abandoned. On the sharded path
+            # it compiled cleanly (runs 1 and 2) and it is worth ~44-60 s per block
+            # instead of ~350-450 s. With it off, the cold compile at a fresh width ran
+            # past the collective watchdog and hung the whole job.
             - name: NKI_ENABLE_TRACE_CACHE
-              value: "0"
+              value: "1"
+            # Collective timeout. The default 30 min is shorter than a cold compile at a
+            # new width, which is exactly how the previous run deadlocked.
+            - name: SF_COLLECTIVE_TIMEOUT_S
+              value: "7200"
             # bf16 | fp32. fp32 is the control for "is this decoder overflow?"
             # -- ruled out: the NaNs are all NaN, zero Inf.
             - name: SF_VAE_DTYPE

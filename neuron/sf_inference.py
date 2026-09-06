@@ -14,6 +14,7 @@ divisible by 8 but not 16, and the SP shard may not split a frame.
 """
 
 import argparse
+import datetime
 import os
 import sys
 import tempfile
@@ -205,7 +206,22 @@ def main():
     args = parse_args()
 
     os.environ.setdefault("NEURON_FALLBACK_ENABLED", "0")
-    dist.init_process_group(backend="neuron")
+
+    # The default collective timeout is 30 min, and a cold compile at a width the
+    # cache has never seen blows straight through it: the watchdog kills a posted
+    # allgather while another rank is still in neuronx-cc, and the run then retries
+    # forever with exponential backoff instead of failing. Give compilation room.
+    timeout_s = int(os.environ.get("SF_COLLECTIVE_TIMEOUT_S", "7200"))
+    try:
+        dist.init_process_group(
+            backend="neuron",
+            timeout=datetime.timedelta(seconds=timeout_s))
+        logger.info("collective timeout: %d s", timeout_s)
+    except TypeError:
+        # Backend does not accept the kwarg on this SDK; do not fail over it.
+        dist.init_process_group(backend="neuron")
+        logger.warning("this backend ignores timeout=; using its default (~1800 s). "
+                       "A long cold compile may trip the collective watchdog.")
     rank = dist.get_rank()
     world = dist.get_world_size()
 
