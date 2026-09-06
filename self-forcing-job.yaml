@@ -132,21 +132,27 @@ spec:
               ls -la wan_models/Wan2.1-T2V-1.3B/ checkpoints/
               echo "Model weights ready."
 
-              # ─── On compile caching, the hard way ────────────────────────
-              # Do NOT set TORCH_NEURONX_NEFF_CACHE_DIR here. Setting it routes
-              # compilation through neuron_dynamo_backend/cache_artifact.py, and on
-              # that path the VAE's first decoder conv fails to compile at full width:
+              # ─── On compile caching ─────────────────────────────────────
+              # The unsharded VAE decode hits a compiler failure on its first conv:
               #   [NCC_INLA001] Allocated memory out of bound SB<0,0>(96x798720)
-              #   DebugInfo <_mem_0||[96, 399360]>      (399360 = 480*832, 96 = VAE dim)
-              # The same graph compiles fine without the variable, the cache was empty
-              # when this happened so it was not a stale hit, and neither of
-              # rolling_forcing's inference jobs sets it -- only their training jobs do.
+              #   DebugInfo <_mem_0||[96, 399360]>    (399360 = 480*832, 96 = VAE dim)
+              # It reproduced both with and without TORCH_NEURONX_NEFF_CACHE_DIR, so
+              # that variable is NOT the cause (an earlier commit here claimed it was;
+              # wrong). It stays unset only because rolling_forcing's inference jobs do
+              # not set it and it bought nothing measurable.
               #
-              # The NKI trace cache (NKI_ENABLE_TRACE_CACHE=1, kept on) has no
-              # directory knob to persist: grepping the installed torch_neuronx turned
-              # up no NKI_*CACHE_DIR-style variable. So compile cost is per-pod, and
-              # MAX_PROMPTS=2 is how the steady-state number gets measured instead --
-              # prompt 1 reuses prompt 0's in-process traces.
+              # What still differs from the run that produced a good video is
+              # NKI_ENABLE_TRACE_CACHE, now back to 0 to match it. That cache's own SDK
+              # warning is that it "may not capture all kernel environment dependencies
+              # or non-argument values and can yield stale cache hits", which is a fair
+              # description of a mis-sized SBUF allocation. It was only ever proven safe
+              # on the SHARDED VAE, where the activations are 8x smaller.
+              #
+              # Cost of 0: roughly 350-450 s per block instead of 44-60 s. The NKI trace
+              # cache has no directory knob to persist either way (grepping the installed
+              # torch_neuronx found no NKI_*CACHE_DIR variable), so MAX_PROMPTS=2 is how
+              # the steady-state number gets measured: prompt 1 reuses prompt 0's
+              # in-process traces regardless of any on-disk cache.
 
               # ─── Run: 8 ranks, TP=4 x SP=2 ───────────────────────────────
               # 8 and not 16: frame_seq_length 1560 (480x832) divides 8, not 16.
@@ -251,11 +257,11 @@ spec:
               value: "134217728"
             - name: USE_NKI_KERNELS
               value: "true"
-            # Back on: the NaNs were identical with this cache on (run 1) and off
-            # (run 3), so it was never implicated -- the sharded VAE was. It is worth
-            # a lot of compile time: ~44-60 s per block with it, ~350-450 s without.
+            # 0, matching the only configuration that has ever produced a good video.
+            # See the compile-caching note above: this is the last env difference
+            # between that run and the two that failed to compile the VAE.
             - name: NKI_ENABLE_TRACE_CACHE
-              value: "1"
+              value: "0"
             # bf16 | fp32. fp32 is the control for "is this decoder overflow?"
             # -- ruled out: the NaNs are all NaN, zero Inf.
             - name: SF_VAE_DTYPE
