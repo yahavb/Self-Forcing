@@ -31,13 +31,40 @@ from models.t5 import (
     init_t5_parallel_group,
 )
 from models.vae import build_vae, destroy_vae_parallel_group, init_vae_parallel_group
+from utils import parallel_state as ps
 from utils import w_shard
 from utils.logging_utils import configure_logging, get_logger
-from utils.video import gather_and_save
+from utils.video import gather_and_save, save_video
 
 from pipeline_self_forcing import build_sf_pipeline, probe
 
 DEBUG_NUMERICS = os.environ.get("SF_DEBUG_NUMERICS", "0") == "1"
+
+# "world": shard the VAE decode over W across all ranks (rolling_forcing's default,
+# via init_vae_parallel_group registering the WORLD group).
+# "none":  give every rank a singleton vae-sp group, so every group-dependent site
+#          in models/vae.py takes its world == 1 fallback -- plain PyTorch conv,
+#          no halo exchange, no extract_w_edges / restore_layout NKI kernels, no
+#          all-gather. Each rank then decodes the full width redundantly.
+VAE_SHARD = os.environ.get("SF_VAE_SHARD", "world")
+assert VAE_SHARD in ("world", "none"), f"SF_VAE_SHARD={VAE_SHARD}"
+
+
+def init_vae_group(rank, world):
+    if VAE_SHARD == "world":
+        init_vae_parallel_group()
+        return world
+    # new_group is collective: every rank must build every singleton, in order.
+    singletons = [dist.new_group([r]) for r in range(world)]
+    ps.register_group("vae-sp", singletons[rank])
+    assert ps.get_world_size("vae-sp") == 1
+    return 1
+
+
+def vae_input(latent, rank, world):
+    """The latent this rank feeds the decoder: its W shard, or the whole thing."""
+    return latent if VAE_SHARD == "none" else w_shard(latent, rank, world)
+
 
 configure_logging()
 logger = get_logger(__name__)
@@ -80,7 +107,7 @@ def vae_selftest(vae, rank, world, latent_h, latent_w, dtype, nfpb=3):
         vae.model.clear_cache()
         pixels = vae.postprocess_pixels(
             vae.decode_to_pixel_device(
-                w_shard(latent.to("neuron"), rank, world),
+                vae_input(latent.to("neuron"), rank, world),
                 use_cache=True, chunk_idx=0))
         probe(f"selftest {name} pixels", pixels)
     vae.model.clear_cache()
@@ -99,7 +126,7 @@ def stream_decode_prompt(pipe, vae, prompt_embeds, noise, rank, world, fps):
         t = time.perf_counter()
 
         chunk_device = vae.decode_to_pixel_device(
-            w_shard(chunk, rank, world), use_cache=True, chunk_idx=chunk_idx)
+            vae_input(chunk, rank, world), use_cache=True, chunk_idx=chunk_idx)
         torch.neuron.synchronize()
         vae_ms = (time.perf_counter() - t) * 1000
 
@@ -139,7 +166,8 @@ def main():
 
     init_t5_parallel_group()
     init_parallel_groups(sp_degree, args.tp_degree)
-    init_vae_parallel_group()
+    vae_world = init_vae_group(rank, world)
+    logger.info("VAE sharding: %s (vae-sp world %d)", VAE_SHARD, vae_world)
 
     torch.manual_seed(args.seed)
     torch.set_grad_enabled(False)
@@ -206,7 +234,13 @@ def main():
             logger.warning("%s (continuing: SF_DEBUG_NUMERICS=1)", msg)
 
         out_path = os.path.join(args.output_folder, f"prompt_{prompt_idx:03d}.mp4")
-        gather_and_save(video_local, out_path, args.fps, rank, world)
+        if VAE_SHARD == "none":
+            # Every rank decoded the full width, so there is nothing to concatenate.
+            if rank == 0:
+                save_video(video_local, out_path, args.fps)
+            dist.barrier()
+        else:
+            gather_and_save(video_local, out_path, args.fps, rank, world)
 
     destroy_t5_parallel_group()
     destroy_parallel_groups()

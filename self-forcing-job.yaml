@@ -139,13 +139,13 @@ spec:
 
               torchrun --nproc_per_node 8 neuron/sf_inference.py \
                 --prompt_file "${PROMPT_FILE}" \
-                --config_path neuron/configs/self_forcing_dmd.yaml \
+                --config_path "${CONFIG_PATH}" \
                 --checkpoint_path checkpoints/self_forcing_dmd.pt \
                 --output_folder videos_sf \
                 --num_output_frames "${NUM_OUTPUT_FRAMES}" \
                 --tp_degree 4 \
                 --latent_h 60 \
-                --latent_w 104 \
+                --latent_w "${LATENT_W}" \
                 --fps "${FPS}" \
                 --max_prompts "${MAX_PROMPTS}" \
                 --use_ema
@@ -232,9 +232,23 @@ spec:
             # non-finite pixels are unexplained; costs compile time only.
             - name: NKI_ENABLE_TRACE_CACHE
               value: "0"
-            # bf16 | fp32. fp32 is the control for "is this decoder overflow?".
+            # bf16 | fp32. fp32 is the control for "is this decoder overflow?"
+            # -- ruled out: the NaNs are all NaN, zero Inf.
             - name: SF_VAE_DTYPE
               value: "bf16"
+            # world | none. "none" gives every rank a singleton vae-sp group, so
+            # models/vae.py takes its world == 1 fallbacks: plain PyTorch conv, no
+            # halo exchange, no extract_w_edges/restore_layout NKI kernels. Each
+            # rank decodes the full width redundantly. This is both the bisection
+            # for the NaN band and a working fallback if the sharded path is broken.
+            - name: SF_VAE_SHARD
+              value: "none"
+            # CONFIG_PATH and LATENT_W must agree: fs1560 <-> 104 (480x832, native),
+            # fs1200 <-> 80 (480x640, the width every RF trn3 job runs).
+            - name: CONFIG_PATH
+              value: "neuron/configs/self_forcing_dmd.yaml"
+            - name: LATENT_W
+              value: "104"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
