@@ -226,6 +226,15 @@ spec:
               value: "134217728"
             - name: USE_NKI_KERNELS
               value: "true"
+            # The SDK warns this cache "can yield stale cache hits". With 8 ranks
+            # sharing it and per-rank-different VAE width shards, a cross-rank hit
+            # is a plausible source of structurally-corrupt output. Off while the
+            # non-finite pixels are unexplained; costs compile time only.
+            - name: NKI_ENABLE_TRACE_CACHE
+              value: "0"
+            # bf16 | fp32. fp32 is the control for "is this decoder overflow?".
+            - name: SF_VAE_DTYPE
+              value: "bf16"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:

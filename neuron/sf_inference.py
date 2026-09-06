@@ -64,6 +64,28 @@ def parse_args():
     return p.parse_args()
 
 
+def vae_selftest(vae, rank, world, latent_h, latent_w, dtype, nfpb=3):
+    """Decode latents the DiT never touched, through the exact production path.
+
+    Decides where the non-finite pixels come from: if zeros and a plain Gaussian
+    also come back non-finite, the width-sharded decode is broken independently of
+    anything the denoising loop produces, and the DiT is exonerated. Shapes match
+    the real chunks, so this reuses their NEFFs rather than compiling new ones.
+    """
+    logger.info("VAE self-test (latents the DiT never saw):")
+    for name, latent in (
+        ("zeros", torch.zeros(1, nfpb, 16, latent_h, latent_w, dtype=dtype)),
+        ("gaussian", torch.randn(1, nfpb, 16, latent_h, latent_w, dtype=dtype)),
+    ):
+        vae.model.clear_cache()
+        pixels = vae.postprocess_pixels(
+            vae.decode_to_pixel_device(
+                w_shard(latent.to("neuron"), rank, world),
+                use_cache=True, chunk_idx=0))
+        probe(f"selftest {name} pixels", pixels)
+    vae.model.clear_cache()
+
+
 def stream_decode_prompt(pipe, vae, prompt_embeds, noise, rank, world, fps):
     """Denoise block by block, decoding each block as soon as it is clean."""
     video_chunks = []
@@ -134,8 +156,13 @@ def main():
                 args.tp_degree, sp_degree)
     pipe = build_sf_pipeline(
         args.config_path, args.checkpoint_path, args.tp_degree, args.use_ema)
-    logger.info("Building VAE decoder...")
-    vae = build_vae(dtype=torch.bfloat16)
+    vae_dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}[
+        os.environ.get("SF_VAE_DTYPE", "bf16")]
+    logger.info("Building VAE decoder (%s)...", vae_dtype)
+    vae = build_vae(dtype=vae_dtype)
+
+    if DEBUG_NUMERICS:
+        vae_selftest(vae, rank, world, args.latent_h, args.latent_w, vae_dtype)
 
     logger.info("Schedule: %d frames / %d per block x (%d denoising steps + 1 cache pass) "
                 "= %d model calls per video",

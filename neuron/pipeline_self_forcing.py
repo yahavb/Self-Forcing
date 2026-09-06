@@ -24,13 +24,25 @@ logger = get_logger(__name__)
 
 def probe(tag, t):
     """Log finiteness and magnitude of a device tensor. Forces a sync — only call
-    under SF_DEBUG_NUMERICS=1."""
+    under SF_DEBUG_NUMERICS=1.
+
+    Splits NaN from +/-Inf (0/0 in a softmax or norm looks different from bf16
+    overflow) and, when something is wrong, reports the bad count per index along
+    dim 1 — the frame axis for both [B,F,C,H,W] latents and [B,T,C,H,W] pixels —
+    so a whole-frame problem is distinguishable from a spatial band.
+    """
     f = t.float()
+    nan = int(torch.isnan(f).sum().item())
+    pinf = int(torch.isposinf(f).sum().item())
+    ninf = int(torch.isneginf(f).sum().item())
     finite = torch.isfinite(f)
-    n_bad = int((~finite).sum().item())
-    absmax = float(f[finite].abs().max().item()) if n_bad < f.numel() else float("nan")
-    logger.info("    probe %-28s absmax %10.4f  nonfinite %d/%d",
-                tag, absmax, n_bad, f.numel())
+    n_bad = nan + pinf + ninf
+    absmax = float(f[finite].abs().max().item()) if bool(finite.any()) else float("nan")
+    logger.info("    probe %-28s absmax %10.4f  bad %d/%d (nan %d +inf %d -inf %d)",
+                tag, absmax, n_bad, f.numel(), nan, pinf, ninf)
+    if n_bad and f.dim() >= 3:
+        per = (~finite).flatten(2).sum(dim=2)[0].tolist()
+        logger.info("      bad per frame: %s", [int(x) for x in per])
     return n_bad == 0
 
 
