@@ -132,33 +132,21 @@ spec:
               ls -la wan_models/Wan2.1-T2V-1.3B/ checkpoints/
               echo "Model weights ready."
 
-              # ─── Compile cache: restore from the PVC ─────────────────────
-              # The flash kernel traces one specialisation per distinct attention-
-              # window length -- 3,6,...,21 frames, so 7 for a 21-frame video -- and
-              # that tracing dominated every block on the earlier runs. Persist the
-              # cache so only the very first run ever pays it.
+              # ─── On compile caching, the hard way ────────────────────────
+              # Do NOT set TORCH_NEURONX_NEFF_CACHE_DIR here. Setting it routes
+              # compilation through neuron_dynamo_backend/cache_artifact.py, and on
+              # that path the VAE's first decoder conv fails to compile at full width:
+              #   [NCC_INLA001] Allocated memory out of bound SB<0,0>(96x798720)
+              #   DebugInfo <_mem_0||[96, 399360]>      (399360 = 480*832, 96 = VAE dim)
+              # The same graph compiles fine without the variable, the cache was empty
+              # when this happened so it was not a stale hit, and neither of
+              # rolling_forcing's inference jobs sets it -- only their training jobs do.
               #
-              # Kept on local disk while running and round-tripped as a tar, the same
-              # way the weights are: /var/mdl is S3-backed and 8 ranks compiling
-              # concurrently against it is not a good bet.
-              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
-              mkdir -p /tmp/neff_cache
-              NEFF_TAR="/var/mdl/self_forcing/neff_cache.tar"
-              if [[ -f "$NEFF_TAR" ]]; then
-                echo "Restoring NEFF cache from $NEFF_TAR"
-                tar xf "$NEFF_TAR" -C /tmp/neff_cache
-                du -sh /tmp/neff_cache
-              else
-                echo "No NEFF cache yet -- this run builds it."
-              fi
-
-              # Find the NKI trace cache's knobs instead of guessing at them: the SDK
-              # warning names NKI_ENABLE_TRACE_CACHE but not where it stores anything.
-              echo "--- NKI_* env vars the installed torch_neuronx reads ---"
-              grep -rhoE 'NKI_[A-Z0-9_]+' /workspace/torch_neuron_eager/torch_neuronx/ 2>/dev/null \
-                | sort -u || echo "(torch_neuronx source not at that path)"
-              echo "--- NKI_*/NEURON_*CACHE* currently set ---"
-              env | grep -E 'NKI_|NEURON.*CACHE|NEFF' | sort || true
+              # The NKI trace cache (NKI_ENABLE_TRACE_CACHE=1, kept on) has no
+              # directory knob to persist: grepping the installed torch_neuronx turned
+              # up no NKI_*CACHE_DIR-style variable. So compile cost is per-pod, and
+              # MAX_PROMPTS=2 is how the steady-state number gets measured instead --
+              # prompt 1 reuses prompt 0's in-process traces.
 
               # ─── Run: 8 ranks, TP=4 x SP=2 ───────────────────────────────
               # 8 and not 16: frame_seq_length 1560 (480x832) divides 8, not 16.
@@ -178,15 +166,6 @@ spec:
                 --fps "${FPS}" \
                 --max_prompts "${MAX_PROMPTS}" \
                 --use_ema
-
-              # ─── Compile cache: persist to the PVC ───────────────────────
-              if [[ -n "$(ls -A /tmp/neff_cache 2>/dev/null)" ]]; then
-                echo "Persisting NEFF cache -> $NEFF_TAR"
-                mkdir -p "$(dirname $NEFF_TAR)"
-                tar cf /tmp/neff_cache.tar -C /tmp/neff_cache .
-                mv /tmp/neff_cache.tar "$NEFF_TAR"
-                du -sh "$NEFF_TAR"
-              fi
 
               # ─── Archive to PVC ──────────────────────────────────────────
               TIMESTAMP=$(date +%Y%m%d_%H%M%S)
