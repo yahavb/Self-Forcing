@@ -132,6 +132,34 @@ spec:
               ls -la wan_models/Wan2.1-T2V-1.3B/ checkpoints/
               echo "Model weights ready."
 
+              # ─── Compile cache: restore from the PVC ─────────────────────
+              # The flash kernel traces one specialisation per distinct attention-
+              # window length -- 3,6,...,21 frames, so 7 for a 21-frame video -- and
+              # that tracing dominated every block on the earlier runs. Persist the
+              # cache so only the very first run ever pays it.
+              #
+              # Kept on local disk while running and round-tripped as a tar, the same
+              # way the weights are: /var/mdl is S3-backed and 8 ranks compiling
+              # concurrently against it is not a good bet.
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              mkdir -p /tmp/neff_cache
+              NEFF_TAR="/var/mdl/self_forcing/neff_cache.tar"
+              if [[ -f "$NEFF_TAR" ]]; then
+                echo "Restoring NEFF cache from $NEFF_TAR"
+                tar xf "$NEFF_TAR" -C /tmp/neff_cache
+                du -sh /tmp/neff_cache
+              else
+                echo "No NEFF cache yet -- this run builds it."
+              fi
+
+              # Find the NKI trace cache's knobs instead of guessing at them: the SDK
+              # warning names NKI_ENABLE_TRACE_CACHE but not where it stores anything.
+              echo "--- NKI_* env vars the installed torch_neuronx reads ---"
+              grep -rhoE 'NKI_[A-Z0-9_]+' /workspace/torch_neuron_eager/torch_neuronx/ 2>/dev/null \
+                | sort -u || echo "(torch_neuronx source not at that path)"
+              echo "--- NKI_*/NEURON_*CACHE* currently set ---"
+              env | grep -E 'NKI_|NEURON.*CACHE|NEFF' | sort || true
+
               # ─── Run: 8 ranks, TP=4 x SP=2 ───────────────────────────────
               # 8 and not 16: frame_seq_length 1560 (480x832) divides 8, not 16.
               echo "============================================"
@@ -150,6 +178,15 @@ spec:
                 --fps "${FPS}" \
                 --max_prompts "${MAX_PROMPTS}" \
                 --use_ema
+
+              # ─── Compile cache: persist to the PVC ───────────────────────
+              if [[ -n "$(ls -A /tmp/neff_cache 2>/dev/null)" ]]; then
+                echo "Persisting NEFF cache -> $NEFF_TAR"
+                mkdir -p "$(dirname $NEFF_TAR)"
+                tar cf /tmp/neff_cache.tar -C /tmp/neff_cache .
+                mv /tmp/neff_cache.tar "$NEFF_TAR"
+                du -sh "$NEFF_TAR"
+              fi
 
               # ─── Archive to PVC ──────────────────────────────────────────
               TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -211,9 +248,12 @@ spec:
               value: "16"
             - name: PROMPT_FILE
               value: "prompts/MovieGenVideoBench_extended.txt"
-            # Start with 1 prompt for bring-up; raise once a video looks right.
+            # 2, not 1, and for a measurement reason: prompt 0 pays for tracing all
+            # 7 attention-window specialisations, prompt 1 reuses them in-process. So
+            # prompt 1 is the honest fps number, and this gets it without depending on
+            # the on-disk cache.
             - name: MAX_PROMPTS
-              value: "1"
+              value: "2"
             # ─── Neuron runtime (mirrors rolling_forcing's inference jobs).
             # No NEURON_LOGICAL_NC_CONFIG: the resource claim sets LNC.
             - name: NEURON_RT_LOG_LEVEL

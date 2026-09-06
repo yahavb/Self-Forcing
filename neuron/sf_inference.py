@@ -198,7 +198,7 @@ def stream_decode_prompt(pipe, vae, prompt_embeds, noise, rank, world, fps):
         logger.info("  video: %d frames in %.2f s -> %.2f fps (%.1f x realtime at %d fps)",
                     video.shape[1], wall, video.shape[1] / wall,
                     (video.shape[1] / wall) / fps, fps)
-    return video
+    return video, block_ms
 
 
 def main():
@@ -252,6 +252,8 @@ def main():
         os.makedirs(args.output_folder, exist_ok=True)
     dist.barrier()
 
+    timings = []
+
     for prompt_idx, prompt in enumerate(prompts):
         logger.info("[prompt %3d/%d] %s...", prompt_idx, len(prompts), prompt[:70])
 
@@ -269,8 +271,9 @@ def main():
         if DEBUG_NUMERICS:
             probe("prompt_embeds", prompt_embeds)
 
-        video_local = stream_decode_prompt(
+        video_local, block_ms = stream_decode_prompt(
             pipe, vae, prompt_embeds, noise, rank, world, args.fps)
+        timings.append((prompt_idx, video_local.shape[1], block_ms))
 
         finite = torch.isfinite(video_local).all().item()
         if not finite:
@@ -290,6 +293,21 @@ def main():
                 save_frames(full, os.path.join(
                     args.output_folder, "frames", f"prompt_{prompt_idx:03d}"))
         dist.barrier()
+
+    if rank == 0 and timings:
+        logger.info("=== per-prompt timing ===")
+        logger.info("The flash kernel traces one specialisation per distinct attention-"
+                    "window length (%d of them here), and they are cached in-process. So "
+                    "prompt 0 carries the tracing cost and later prompts do not: those "
+                    "are the numbers to quote.",
+                    args.num_output_frames // pipe.num_frame_per_block)
+        for idx, frames, bm in timings:
+            wall = sum(bm) / 1000.0
+            tag = " (includes kernel tracing)" if idx == 0 else ""
+            logger.info("  prompt %3d: %2d frames  %7.2f s  %5.2f fps  "
+                        "block min %7.1f ms / median %7.1f ms%s",
+                        idx, frames, wall, frames / wall,
+                        min(bm), sorted(bm)[len(bm) // 2], tag)
 
     destroy_t5_parallel_group()
     destroy_parallel_groups()
