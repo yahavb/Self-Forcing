@@ -1,0 +1,218 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: self-forcing
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: self-forcing
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        # Must yield at least 8 NeuronCores at LNC=1 (the run uses exactly 8:
+        # TP=4 x SP=2). Confirm what exists before applying:
+        #   kubectl get resourceclaimtemplates
+        # m-lnc1 is what rolling_forcing/rf-job.yaml uses on this cluster.
+        # Do NOT substitute an LNC=2 template (e.g. l-lnc2) — the port assumes LNC=1.
+        - name: neurons
+          resourceClaimTemplateName: m-lnc1
+      containers:
+        - name: inference
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euxo pipefail
+
+              SF_BRANCH="${SF_BRANCH:-neuron-trn}"
+              # rolling_forcing supplies the Neuron stack (models/, kernels/, utils/).
+              # Pinned: models/kernels/utils/e2e_pipeline.py at this commit are what the
+              # port was written against (identical across origin/main and rf-distill-1.3b).
+              RF_COMMIT="${RF_COMMIT:-0cfc734656aa0ff72438f4ba2771056f4df52807}"
+
+              cd /tmp
+              git clone -b "$SF_BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/Self-Forcing.git
+              git clone https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/rolling_forcing.git
+              git -C rolling_forcing checkout --detach "$RF_COMMIT"
+
+              echo "┌── PROVENANCE ──"
+              echo "│ Self-Forcing : $(git -C Self-Forcing rev-parse --abbrev-ref HEAD) @ $(git -C Self-Forcing rev-parse HEAD)"
+              echo "│                $(git -C Self-Forcing log -1 --pretty=%s)"
+              echo "│ neuron stack : rolling_forcing @ $(git -C rolling_forcing rev-parse HEAD)"
+              echo "└────────────────"
+
+              cd /tmp/Self-Forcing
+              export PYTHONPATH=/tmp/rolling_forcing
+
+              # ─── Install deps (same set as rolling-forcing-job.yaml) ──────
+              uv pip install \
+                "diffusers==0.37.1" \
+                "transformers==5.8.1" \
+                "huggingface-hub==1.16.4" \
+                "click" \
+                "einops==0.8.2" \
+                "omegaconf==2.3.0" \
+                "ftfy==6.3.1" \
+                "regex==2026.5.9" \
+                "av==17.0.1"
+
+              # ─── Schedule gate: cheap, catches a bad port before the device ──
+              python3 neuron/tests/test_schedule.py
+
+              # ─── Model weights: Wan2.1-T2V-1.3B (T5 + VAE) ────────────────
+              # Shared with rolling_forcing — same backbone, same tar.
+              WAN_TAR="/var/mdl/rolling_forcing/Wan2.1-T2V-1.3B.tar"
+
+              if [[ -f "$WAN_TAR" ]]; then
+                echo "Extracting Wan2.1-T2V-1.3B from PVC cache..."
+                mkdir -p wan_models
+                tar xf "$WAN_TAR" -C wan_models/
+              else
+                echo "Downloading Wan2.1-T2V-1.3B from HuggingFace..."
+                python3 -c "
+              from huggingface_hub import snapshot_download
+              snapshot_download('Wan-AI/Wan2.1-T2V-1.3B', local_dir='wan_models/Wan2.1-T2V-1.3B', local_dir_use_symlinks=False)
+              "
+                echo "Caching to PVC..."
+                tar cf /tmp/Wan2.1-T2V-1.3B.tar -C wan_models Wan2.1-T2V-1.3B
+                mkdir -p "$(dirname $WAN_TAR)"
+                cp /tmp/Wan2.1-T2V-1.3B.tar "$WAN_TAR"
+                rm -f /tmp/Wan2.1-T2V-1.3B.tar
+              fi
+
+              # ─── Model weights: Self-Forcing DMD checkpoint ───────────────
+              DMD_TAR="/var/mdl/self_forcing/self_forcing_dmd.tar"
+
+              if [[ -f "$DMD_TAR" ]]; then
+                echo "Extracting Self-Forcing DMD checkpoint from PVC cache..."
+                mkdir -p checkpoints
+                tar xf "$DMD_TAR" -C checkpoints/
+              else
+                echo "Downloading Self-Forcing DMD checkpoint from HuggingFace..."
+                python3 -c "
+              from huggingface_hub import snapshot_download
+              snapshot_download('gdhe17/Self-Forcing', allow_patterns='checkpoints/self_forcing_dmd.pt', local_dir='.', local_dir_use_symlinks=False)
+              "
+                echo "Caching to PVC..."
+                tar cf /tmp/self_forcing_dmd.tar -C checkpoints self_forcing_dmd.pt
+                mkdir -p "$(dirname $DMD_TAR)"
+                cp /tmp/self_forcing_dmd.tar "$DMD_TAR"
+                rm -f /tmp/self_forcing_dmd.tar
+              fi
+
+              ls -la wan_models/Wan2.1-T2V-1.3B/ checkpoints/
+              echo "Model weights ready."
+
+              # ─── Run: 8 ranks, TP=4 x SP=2 ───────────────────────────────
+              # 8 and not 16: frame_seq_length 1560 (480x832) divides 8, not 16.
+              echo "============================================"
+              echo "  Self-Forcing T2V: TP=4 SP=2, ${NUM_OUTPUT_FRAMES} latent frames"
+              echo "============================================"
+
+              torchrun --nproc_per_node 8 neuron/sf_inference.py \
+                --prompt_file "${PROMPT_FILE}" \
+                --config_path neuron/configs/self_forcing_dmd.yaml \
+                --checkpoint_path checkpoints/self_forcing_dmd.pt \
+                --output_folder videos_sf \
+                --num_output_frames "${NUM_OUTPUT_FRAMES}" \
+                --tp_degree 4 \
+                --latent_h 60 \
+                --latent_w 104 \
+                --fps "${FPS}" \
+                --max_prompts "${MAX_PROMPTS}" \
+                --use_ema
+
+              # ─── Archive to PVC ──────────────────────────────────────────
+              TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+              ARCHIVE_DIR="/var/mdl/self_forcing/runs/${TIMESTAMP}"
+              echo "============================================"
+              echo "  ARCHIVING to $ARCHIVE_DIR"
+              echo "============================================"
+              mkdir -p "$ARCHIVE_DIR"
+              cp videos_sf/*.mp4 "$ARCHIVE_DIR/" 2>/dev/null || true
+              git -C /tmp/Self-Forcing rev-parse HEAD > "$ARCHIVE_DIR/self_forcing.sha"
+              git -C /tmp/rolling_forcing rev-parse HEAD > "$ARCHIVE_DIR/rolling_forcing.sha"
+              ls -la "$ARCHIVE_DIR/"
+
+              echo "═══════════════════════════════════════════"
+              echo "  Done! Self-Forcing inference complete"
+              echo "═══════════════════════════════════════════"
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 30
+              memory: 250Gi
+              ephemeral-storage: 250Gi
+            limits:
+              cpu: 30
+              memory: 250Gi
+              ephemeral-storage: 250Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # Which code to run. SF_BRANCH is the branch of yahavb/Self-Forcing
+            # holding neuron/; RF_COMMIT pins the Neuron stack.
+            - name: SF_BRANCH
+              value: "neuron-trn"
+            - name: RF_COMMIT
+              value: "0cfc734656aa0ff72438f4ba2771056f4df52807"
+            # Run shape. 21 latent frames -> 81 pixel frames; the checkpoint was
+            # distilled at 21 and asserts if pushed past the attention window.
+            - name: NUM_OUTPUT_FRAMES
+              value: "21"
+            - name: FPS
+              value: "16"
+            - name: PROMPT_FILE
+              value: "prompts/MovieGenVideoBench_extended.txt"
+            # Start with 1 prompt for bring-up; raise once a video looks right.
+            - name: MAX_PROMPTS
+              value: "1"
+            # ─── Neuron runtime (mirrors rolling_forcing's inference jobs).
+            # No NEURON_LOGICAL_NC_CONFIG: the resource claim sets LNC.
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: TORCH_NEURONX_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_FALLBACK_ENABLED
+              value: "0"
+            - name: NEURON_CC_FLAGS
+              value: "--model-type=transformer"
+            - name: NEURON_RT_ASYNC_EXEC_MAX_INFLIGHT_REQUESTS
+              value: "0"
+            - name: NEURON_RT_DBG_INTRA_RDH_CHANNEL_BUFFER_SIZE
+              value: "134217728"
+            - name: USE_NKI_KERNELS
+              value: "true"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc

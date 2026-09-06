@@ -1,0 +1,33 @@
+# Self-Forcing chunk-wise DMD checkpoint, Neuron inference.
+# Self-contained: neuron/pipeline_self_forcing.py does NOT merge
+# configs/default_config.yaml (that file carries training-only keys and the
+# rolling_forcing copy of it would resolve against the wrong working directory).
+
+# The released 4-step chunk-wise DMD schedule (configs/self_forcing_dmd.yaml).
+# warp_denoising_step maps these onto the shifted flow-match timesteps, and
+# requires that the list does NOT end in 0.
+denoising_step_list:
+  - 1000
+  - 750
+  - 500
+  - 250
+warp_denoising_step: true
+timestep_shift: 5.0
+
+num_frame_per_block: 3
+context_noise: 0
+
+# Global attention over every frame generated so far, which is what this
+# checkpoint was distilled with. Selects the updating_cache=True assembly path.
+local_attn_size: -1
+sink_size: 0
+
+model_name: Wan2.1-T2V-1.3B
+
+# Patched tokens per frame: (latent_h/2) * (latent_w/2) = 30 * 52 for the
+# 60x104 latent behind 480x832. MUST equal the runtime h*w or cache slicing and
+# RoPE indexing go wrong silently -- pipeline_self_forcing._sf_asserts checks it.
+# Also must divide world_size: 1560 = 8*195 is fine at 8 ranks, NOT at 16.
+# Running 16 ranks would need a smaller latent (480x640 -> 1200) as
+# rolling_forcing does.
+frame_seq_length: 1560
