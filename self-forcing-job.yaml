@@ -200,15 +200,13 @@ spec:
               value: "0cfc734656aa0ff72438f4ba2771056f4df52807"
             # Run shape. 21 latent frames -> 81 pixel frames; the checkpoint was
             # distilled at 21 and asserts if pushed past the attention window.
-            # BRING-UP: 6 (2 blocks) while chasing the non-finite pixels — it
-            # exercises block 0 (unroped anchor) and block 1 (anchor re-RoPE +
-            # carry) at a third of the device time. Restore 21 once clean.
             - name: NUM_OUTPUT_FRAMES
-              value: "6"
-            # Per-call finiteness/magnitude probes, and don't abort on non-finite
-            # pixels so one run localizes the problem. Set to "0" for real runs.
+              value: "21"
+            # Per-call finiteness/magnitude probes; each forces a device sync, so
+            # off for real runs. The cheap end-of-video finiteness check still runs
+            # and now raises, since clean output is the expectation.
             - name: SF_DEBUG_NUMERICS
-              value: "1"
+              value: "0"
             - name: FPS
               value: "16"
             - name: PROMPT_FILE
@@ -234,12 +232,11 @@ spec:
               value: "134217728"
             - name: USE_NKI_KERNELS
               value: "true"
-            # The SDK warns this cache "can yield stale cache hits". With 8 ranks
-            # sharing it and per-rank-different VAE width shards, a cross-rank hit
-            # is a plausible source of structurally-corrupt output. Off while the
-            # non-finite pixels are unexplained; costs compile time only.
+            # Back on: the NaNs were identical with this cache on (run 1) and off
+            # (run 3), so it was never implicated -- the sharded VAE was. It is worth
+            # a lot of compile time: ~44-60 s per block with it, ~350-450 s without.
             - name: NKI_ENABLE_TRACE_CACHE
-              value: "0"
+              value: "1"
             # bf16 | fp32. fp32 is the control for "is this decoder overflow?"
             # -- ruled out: the NaNs are all NaN, zero Inf.
             - name: SF_VAE_DTYPE
