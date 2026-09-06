@@ -132,27 +132,27 @@ spec:
               ls -la wan_models/Wan2.1-T2V-1.3B/ checkpoints/
               echo "Model weights ready."
 
-              # ─── On compile caching ─────────────────────────────────────
-              # The unsharded VAE decode hits a compiler failure on its first conv:
+              # ─── Why this runs SHARDED at 480x640 ───────────────────────
+              # The unsharded decode cannot fit, and the compiler error says so in its
+              # own numbers:
               #   [NCC_INLA001] Allocated memory out of bound SB<0,0>(96x798720)
-              #   DebugInfo <_mem_0||[96, 399360]>    (399360 = 480*832, 96 = VAE dim)
-              # It reproduced both with and without TORCH_NEURONX_NEFF_CACHE_DIR, so
-              # that variable is NOT the cause (an earlier commit here claimed it was;
-              # wrong). It stays unset only because rolling_forcing's inference jobs do
-              # not set it and it bought nothing measurable.
+              # 798720 bytes per partition is exactly 480*832*2 -- one full-width frame
+              # at the decoder's last stage (96 channels, bf16). Sharded over 8 ranks the
+              # same tensor is 480*104*2 = 99840, 8x smaller, which is why the sharded
+              # path compiles and the unsharded one does not. cached_decode makes it
+              # worse still for chunk_idx > 0, where it batches all 3 frames into one
+              # decoder call instead of looping per frame (models/vae.py:490-492).
               #
-              # What still differs from the run that produced a good video is
-              # NKI_ENABLE_TRACE_CACHE, now back to 0 to match it. That cache's own SDK
-              # warning is that it "may not capture all kernel environment dependencies
-              # or non-argument values and can yield stale cache hits", which is a fair
-              # description of a mis-sized SBUF allocation. It was only ever proven safe
-              # on the SHARDED VAE, where the activations are 8x smaller.
+              # Two env-variable hypotheses were wrong before this was understood:
+              # TORCH_NEURONX_NEFF_CACHE_DIR and NKI_ENABLE_TRACE_CACHE were each blamed
+              # and each cleared by re-running without them. No env setting can shrink a
+              # tensor.
               #
-              # Cost of 0: roughly 350-450 s per block instead of 44-60 s. The NKI trace
-              # cache has no directory knob to persist either way (grepping the installed
-              # torch_neuronx found no NKI_*CACHE_DIR variable), so MAX_PROMPTS=2 is how
-              # the steady-state number gets measured: prompt 1 reuses prompt 0's
-              # in-process traces regardless of any on-disk cache.
+              # So: shard the VAE, and do it at latent_w=80 (480x640, frame_seq_length
+              # 1200) -- the exact width every rolling_forcing job on trn3-dev1 runs.
+              # That also sidesteps the 13-column shard 104 produces, which is where the
+              # sharded NaNs showed up; 80 gives each rank an even 10 columns.
+              # The DiT at 21 frames is already proven to compile on the sharded path.
 
               # ─── Run: 8 ranks, TP=4 x SP=2 ───────────────────────────────
               # 8 and not 16: frame_seq_length 1560 (480x832) divides 8, not 16.
@@ -227,8 +227,12 @@ spec:
             # Per-call finiteness/magnitude probes; each forces a device sync, so
             # off for real runs. The cheap end-of-video finiteness check still runs
             # and now raises, since clean output is the expectation.
+            # On for this run purely for the early signal: vae_selftest decodes a zeros
+            # and a gaussian latent before any real work, so a NaN shows up in about a
+            # minute instead of after the blocks. It also keeps non-finite pixels
+            # non-fatal, so the video still gets written for inspection.
             - name: SF_DEBUG_NUMERICS
-              value: "0"
+              value: "1"
             - name: FPS
               value: "16"
             - name: PROMPT_FILE
@@ -272,7 +276,7 @@ spec:
             # rank decodes the full width redundantly. This is both the bisection
             # for the NaN band and a working fallback if the sharded path is broken.
             - name: SF_VAE_SHARD
-              value: "none"
+              value: "world"
             # One PNG per frame in videos_sf/frames/prompt_NNN/, archived to the PVC
             # alongside the mp4.
             - name: SF_SAVE_FRAMES
@@ -280,9 +284,9 @@ spec:
             # CONFIG_PATH and LATENT_W must agree: fs1560 <-> 104 (480x832, native),
             # fs1200 <-> 80 (480x640, the width every RF trn3 job runs).
             - name: CONFIG_PATH
-              value: "neuron/configs/self_forcing_dmd.yaml"
+              value: "neuron/configs/self_forcing_dmd_fs1200.yaml"
             - name: LATENT_W
-              value: "104"
+              value: "80"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
