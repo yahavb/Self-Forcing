@@ -192,8 +192,15 @@ spec:
               value: "0cfc734656aa0ff72438f4ba2771056f4df52807"
             # Run shape. 21 latent frames -> 81 pixel frames; the checkpoint was
             # distilled at 21 and asserts if pushed past the attention window.
+            # BRING-UP: 6 (2 blocks) while chasing the non-finite pixels — it
+            # exercises block 0 (unroped anchor) and block 1 (anchor re-RoPE +
+            # carry) at a third of the device time. Restore 21 once clean.
             - name: NUM_OUTPUT_FRAMES
-              value: "21"
+              value: "6"
+            # Per-call finiteness/magnitude probes, and don't abort on non-finite
+            # pixels so one run localizes the problem. Set to "0" for real runs.
+            - name: SF_DEBUG_NUMERICS
+              value: "1"
             - name: FPS
               value: "16"
             - name: PROMPT_FILE

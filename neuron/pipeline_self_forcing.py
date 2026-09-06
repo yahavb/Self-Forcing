@@ -6,6 +6,8 @@ causal DiT, same NKI kernels, same TP/SP sharding. Only the denoising schedule
 is Self-Forcing's.
 """
 
+import os
+
 import torch
 from omegaconf import OmegaConf
 
@@ -18,6 +20,18 @@ from utils.logging_utils import get_logger
 from schedule import CACHE, DENOISE, sf_schedule
 
 logger = get_logger(__name__)
+
+
+def probe(tag, t):
+    """Log finiteness and magnitude of a device tensor. Forces a sync — only call
+    under SF_DEBUG_NUMERICS=1."""
+    f = t.float()
+    finite = torch.isfinite(f)
+    n_bad = int((~finite).sum().item())
+    absmax = float(f[finite].abs().max().item()) if n_bad < f.numel() else float("nan")
+    logger.info("    probe %-28s absmax %10.4f  nonfinite %d/%d",
+                tag, absmax, n_bad, f.numel())
+    return n_bad == 0
 
 
 class SelfForcingInferencePipeline(CausalInferencePipeline):
@@ -144,6 +158,15 @@ class SelfForcingInferencePipeline(CausalInferencePipeline):
             for t in steps
         }
 
+        debug = os.environ.get("SF_DEBUG_NUMERICS", "0") == "1"
+        if debug:
+            logger.info("  numerics debug on: warped steps %s -> sigmas %s, "
+                        "context_noise %s -> sigma %.6f",
+                        [round(t, 2) for t in steps],
+                        [round(sigma_of[t], 4) for t in steps],
+                        self.context_noise, self.context_sigma)
+            probe("noise (input)", noise)
+
         pred_x0 = None
         for call in sf_schedule(num_frames, nfpb, steps, self.context_noise):
             if call.kind == DENOISE:
@@ -152,6 +175,8 @@ class SelfForcingInferencePipeline(CausalInferencePipeline):
                         noise[:, call.start_frame:call.start_frame + nfpb])
                 block_timestep.fill_(call.timestep)
                 block_sigma.fill_(sigma_of[call.timestep])
+                if debug:
+                    probe(f"b{call.block_index} s{call.step_index} xt_in", block_input)
                 _, pred_x0 = self.generator(
                     noisy_image_or_video=block_input,
                     conditional_dict=conditional_dict,
@@ -165,6 +190,8 @@ class SelfForcingInferencePipeline(CausalInferencePipeline):
                     mode="denoise",
                     updating_cache=True,
                 )
+                if debug:
+                    probe(f"b{call.block_index} s{call.step_index} pred_x0", pred_x0)
                 if call.renoise_to is not None:
                     fresh = torch.randn(
                         [batch_size * nfpb, num_channels, height, width],
@@ -193,6 +220,14 @@ class SelfForcingInferencePipeline(CausalInferencePipeline):
                 mode="denoise",
                 updating_cache=True,
             )
+            if debug:
+                probe(f"b{call.block_index} clean_latent", block_clean)
+                for i in (0, self.num_transformer_blocks // 2,
+                          self.num_transformer_blocks - 1):
+                    kv = self.kv_cache_clean[i]
+                    probe(f"b{call.block_index} kv[{i}].k"
+                          f"[:{kv['local_end_index']}]",
+                          kv["k"][:, :kv["local_end_index"]])
             if streaming:
                 yield block_clean.clone()
             else:

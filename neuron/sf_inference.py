@@ -35,7 +35,9 @@ from utils import w_shard
 from utils.logging_utils import configure_logging, get_logger
 from utils.video import gather_and_save
 
-from pipeline_self_forcing import build_sf_pipeline
+from pipeline_self_forcing import build_sf_pipeline, probe
+
+DEBUG_NUMERICS = os.environ.get("SF_DEBUG_NUMERICS", "0") == "1"
 
 configure_logging()
 logger = get_logger(__name__)
@@ -81,6 +83,9 @@ def stream_decode_prompt(pipe, vae, prompt_embeds, noise, rank, world, fps):
 
         chunk_video = vae.postprocess_pixels(chunk_device)
         video_chunks.append(chunk_video)
+        if DEBUG_NUMERICS:
+            probe(f"chunk {chunk_idx} latent_in", chunk)
+            probe(f"chunk {chunk_idx} pixels_out", chunk_video)
 
         frames = chunk_video.shape[1]
         total = dit_ms + vae_ms
@@ -157,12 +162,21 @@ def main():
         prompt_embeds = encode_one_prompt(text_encoder, prompt)
         torch.neuron.synchronize()
         logger.info("  T5:        %8.1f ms", (time.perf_counter() - t) * 1000)
+        if DEBUG_NUMERICS:
+            probe("prompt_embeds", prompt_embeds)
 
         video_local = stream_decode_prompt(
             pipe, vae, prompt_embeds, noise, rank, world, args.fps)
 
-        assert torch.isfinite(video_local).all(), (
-            f"prompt {prompt_idx} produced non-finite pixels on rank {rank}")
+        finite = torch.isfinite(video_local).all().item()
+        if not finite:
+            # Under the debug flag, keep going: the mp4 still gets written and
+            # archived, and one run then shows the whole picture instead of
+            # dying at the first prompt.
+            msg = f"prompt {prompt_idx} produced non-finite pixels on rank {rank}"
+            if not DEBUG_NUMERICS:
+                raise AssertionError(msg)
+            logger.warning("%s (continuing: SF_DEBUG_NUMERICS=1)", msg)
 
         out_path = os.path.join(args.output_folder, f"prompt_{prompt_idx:03d}.mp4")
         gather_and_save(video_local, out_path, args.fps, rank, world)
