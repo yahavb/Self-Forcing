@@ -258,9 +258,16 @@ spec:
             # BRING-UP: 6 (2 blocks) while chasing the non-finite pixels — it
             # exercises block 0 (unroped anchor) and block 1 (anchor re-RoPE +
             # carry) at a third of the device time. Restore 21 once clean.
-            # Rank count. 1200 % 8 == 0 and 1200 % 16 == 0, so both are valid here.
+            # Rank count. 16 is the measured-good value (0.78 fps, run 20260907_045344)
+            # and mirrors rolling_forcing. 8 is dimensionally valid (1200 % 8 == 0) but
+            # hung: 7 ranks parked on one collective with escalating 120/240/480/960 s
+            # retries while one rank was elsewhere. Reading the SP=2 path found no
+            # rank-divergent collective -- q_local L/world=450 all-gathered over 4 tp
+            # ranks gives 1800 = L/sp, consistent; the KV buffer still rounds to 32768.
+            # What does change is that every graph shape is new at 8 ranks, so one
+            # straggler in a cold compile parks the rest. Unexplained, so not used.
             - name: NPROC
-              value: "8"
+              value: "16"
             - name: NUM_OUTPUT_FRAMES
               value: "21"
             # Per-call finiteness/magnitude probes, and don't abort on non-finite
