@@ -225,11 +225,11 @@ spec:
             # cause by loading the big checkpoints a quarter of the ranks at a time.
             requests:
               cpu: 30
-              memory: 250Gi
+              memory: 500Gi
               ephemeral-storage: 250Gi
             limits:
               cpu: 30
-              memory: 250Gi
+              memory: 500Gi
               ephemeral-storage: 250Gi
           volumeMounts:
             - name: dshm
