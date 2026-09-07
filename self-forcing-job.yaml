@@ -211,13 +211,20 @@ spec:
           resources:
             claims:
               - name: neurons
+            # 16 ranks each torch.load the 11.4GB T5 encoder and the 5.7GB DiT
+            # checkpoint on the host before sharding, so host RAM scales with rank
+            # count: ~270GB of checkpoint alone. 250Gi was sized for 8 ranks and got
+            # OOMKilled at 16. Node allocatable is ~191 cpu / ~1957Gi memory, so this
+            # leaves plenty of headroom and still schedules.
+            # Ephemeral stays at 250Gi: it holds only the weights (~20GB), and one node
+            # in this cluster has just ~460GiB, where a larger request goes Pending.
             requests:
-              cpu: 30
-              memory: 250Gi
+              cpu: 64
+              memory: 900Gi
               ephemeral-storage: 250Gi
             limits:
-              cpu: 30
-              memory: 250Gi
+              cpu: 64
+              memory: 900Gi
               ephemeral-storage: 250Gi
           volumeMounts:
             - name: dshm
