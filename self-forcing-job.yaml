@@ -255,8 +255,13 @@ spec:
               value: "21"
             # Per-call finiteness/magnitude probes, and don't abort on non-finite
             # pixels so one run localizes the problem. Set to "0" for real runs.
+            # MUST be 0 for any run whose fps is quoted. The probes sync the device inside
+            # the DiT phase -- clean_latent plus three KV-cache probes over millions of
+            # elements per block, all counted in dit_ms -- so they report worse than the
+            # truth. Correctness was already established with them on: the 20260907_023131
+            # run was clean end to end.
             - name: SF_DEBUG_NUMERICS
-              value: "1"
+              value: "0"
             - name: FPS
               value: "16"
             - name: PROMPT_FILE
@@ -265,7 +270,7 @@ spec:
             # specialisation per distinct attention-window length (7 at 21 frames),
             # prompt 1 reuses them in-process. Prompt 1 is the honest fps.
             - name: MAX_PROMPTS
-              value: "2"
+              value: "3"
             # ─── Neuron runtime (mirrors rolling_forcing's inference jobs).
             # No NEURON_LOGICAL_NC_CONFIG: the resource claim sets LNC.
             - name: NEURON_RT_LOG_LEVEL
@@ -288,8 +293,12 @@ spec:
             # sharing it and per-rank-different VAE width shards, a cross-rank hit
             # is a plausible source of structurally-corrupt output. Off while the
             # non-finite pixels are unexplained; costs compile time only.
+            # 1 to cut prompt 0's tracing (~44-60 s vs ~350-450 s per block). It does not
+            # touch steady-state execution. Every failure once blamed on it was on the
+            # unsharded path, which is gone; the sharded path has run clean with it both on
+            # (runs 1-2) and off (20260907_023131).
             - name: NKI_ENABLE_TRACE_CACHE
-              value: "0"
+              value: "1"
             # bf16 | fp32. fp32 is the control for "is this decoder overflow?"
             # -- ruled out: the NaNs are all NaN, zero Inf.
             - name: SF_VAE_DTYPE
