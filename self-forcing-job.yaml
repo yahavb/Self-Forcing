@@ -12,15 +12,13 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        node-type: trn3-dev1
+        node-type: trn2
       resourceClaims:
-        # Must yield at least 8 NeuronCores at LNC=1 (the run uses exactly 8:
-        # TP=4 x SP=2). Confirm what exists before applying:
-        #   kubectl get resourceclaimtemplates
-        # m-lnc1 is what rolling_forcing/rf-job.yaml uses on this cluster.
-        # Do NOT substitute an LNC=2 template (e.g. l-lnc2) — the port assumes LNC=1.
-        - name: neurons
-          resourceClaimTemplateName: m-lnc1
+        # trn2, matching rolling_forcing/rolling-forcing-job.yaml. trn3-dev1 was at 95%
+        # memory and could not fit this alongside its neighbours. To go back: node-type
+        # trn3-dev1 + claim m-lnc1 + NPROC 16 + LATENT_W 80 + the fs1200 config.
+        - name: m-trn2
+          resourceClaimTemplateName: m-trn2
       containers:
         - name: inference
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -177,7 +175,7 @@ spec:
               # doubles, the work is compute-bound after all and 16 is right.
               # 1200 divides both 8 and 16, so the width does not have to change.
               echo "============================================"
-              echo "  Self-Forcing T2V: TP=4 SP=2, ${NUM_OUTPUT_FRAMES} latent frames"
+              echo "  Self-Forcing T2V on trn2: ${NPROC} ranks TP=4, ${NUM_OUTPUT_FRAMES} latent frames"
               echo "============================================"
 
               torchrun --nproc_per_node ${NPROC} neuron/sf_inference.py \
@@ -217,20 +215,17 @@ spec:
               echo "═══════════════════════════════════════════"
           resources:
             claims:
-              - name: neurons
-            # Sized to match rolling_forcing/rf-job.yaml so this job coexists with
-            # others on the node. It briefly ran at cpu 64 / memory 900Gi, which left
-            # nothing for anyone else and put other jobs in Pending -- that was me
-            # papering over an OOM with a bigger number. SF_LOAD_WAVES fixes the actual
-            # cause by loading the big checkpoints a quarter of the ranks at a time.
+              - name: m-trn2
+            # Exactly rolling-forcing-job.yaml's trn2 footprint. No ephemeral-storage
+            # request, matching theirs: one node in this cluster has only ~460GiB and a
+            # large request goes Pending. SF_LOAD_WAVES keeps the checkpoint-load peak
+            # well inside this.
             requests:
-              cpu: 30
-              memory: 250Gi
-              ephemeral-storage: 250Gi
+              cpu: 24
+              memory: 256Gi
             limits:
-              cpu: 30
-              memory: 250Gi
-              ephemeral-storage: 250Gi
+              cpu: 24
+              memory: 256Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
@@ -269,7 +264,7 @@ spec:
             - name: SF_LOAD_WAVES
               value: "4"
             - name: NPROC
-              value: "16"
+              value: "8"
             - name: NUM_OUTPUT_FRAMES
               value: "21"
             # Per-call finiteness/magnitude probes, and don't abort on non-finite
@@ -342,9 +337,9 @@ spec:
             # CONFIG_PATH and LATENT_W must agree: fs1560 <-> 104 (480x832, native),
             # fs1200 <-> 80 (480x640, the width every RF trn3 job runs).
             - name: CONFIG_PATH
-              value: "neuron/configs/self_forcing_dmd_fs1200.yaml"
+              value: "neuron/configs/self_forcing_dmd.yaml"
             - name: LATENT_W
-              value: "80"
+              value: "104"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
