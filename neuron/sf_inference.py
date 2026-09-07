@@ -141,6 +141,27 @@ def parse_args():
     return p.parse_args()
 
 
+def staggered(rank, world, waves, fn):
+    """Run fn on a fraction of the ranks at a time, so host RAM peak is world/waves.
+
+    Every rank torch.loads the full 11.4GB T5 encoder and the 5.7GB DiT checkpoint
+    before sharding, so 16 ranks loading at once peaks near 270GB and OOMKilled the
+    pod at 250Gi. Raising the request to 900Gi (what I did first) just monopolised the
+    node and left no room for other jobs. Loading in waves fixes the cause: with 4
+    waves the peak is a quarter, and the pod fits in the same 250Gi rolling_forcing
+    asks for.
+    """
+    if waves <= 1:
+        return fn()
+    per_wave = (world + waves - 1) // waves
+    out = None
+    for w in range(waves):
+        if rank // per_wave == w:
+            out = fn()
+        dist.barrier()          # every rank every wave, so this cannot deadlock
+    return out
+
+
 def vae_selftest(vae, rank, world, latent_h, latent_w, dtype, nfpb=3):
     """Decode latents the DiT never touched, through the exact production path.
 
@@ -243,12 +264,14 @@ def main():
         prompts = prompts[:args.max_prompts]
     logger.info("Loaded %d prompts from %s", len(prompts), args.prompt_file)
 
-    logger.info("Building T5 text encoder...")
-    text_encoder = build_text_encoder(device="neuron")
+    waves = int(os.environ.get("SF_LOAD_WAVES", "4"))
+    logger.info("Building T5 text encoder (%d load waves)...", waves)
+    text_encoder = staggered(rank, world, waves,
+                             lambda: build_text_encoder(device="neuron"))
     logger.info("Building Self-Forcing DiT pipeline (TP=%d SP=%d)...",
                 args.tp_degree, sp_degree)
-    pipe = build_sf_pipeline(
-        args.config_path, args.checkpoint_path, args.tp_degree, args.use_ema)
+    pipe = staggered(rank, world, waves, lambda: build_sf_pipeline(
+        args.config_path, args.checkpoint_path, args.tp_degree, args.use_ema))
     vae_dtype = {"bf16": torch.bfloat16, "fp32": torch.float32}[
         os.environ.get("SF_VAE_DTYPE", "bf16")]
     logger.info("Building VAE decoder (%s)...", vae_dtype)
