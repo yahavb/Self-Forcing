@@ -252,7 +252,7 @@ spec:
             # exercises block 0 (unroped anchor) and block 1 (anchor re-RoPE +
             # carry) at a third of the device time. Restore 21 once clean.
             - name: NUM_OUTPUT_FRAMES
-              value: "6"
+              value: "21"
             # Per-call finiteness/magnitude probes, and don't abort on non-finite
             # pixels so one run localizes the problem. Set to "0" for real runs.
             - name: SF_DEBUG_NUMERICS
@@ -261,9 +261,11 @@ spec:
               value: "16"
             - name: PROMPT_FILE
               value: "prompts/MovieGenVideoBench_extended.txt"
-            # Start with 1 prompt for bring-up; raise once a video looks right.
+            # 2, for measurement: prompt 0 pays to trace one flash-attention
+            # specialisation per distinct attention-window length (7 at 21 frames),
+            # prompt 1 reuses them in-process. Prompt 1 is the honest fps.
             - name: MAX_PROMPTS
-              value: "1"
+              value: "2"
             # ─── Neuron runtime (mirrors rolling_forcing's inference jobs).
             # No NEURON_LOGICAL_NC_CONFIG: the resource claim sets LNC.
             - name: NEURON_RT_LOG_LEVEL
