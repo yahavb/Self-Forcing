@@ -56,6 +56,24 @@ spec:
               echo "│ neuron stack : rolling_forcing @ $(git -C rolling_forcing rev-parse HEAD)"
               echo "└────────────────"
 
+              # ─── ENVIRONMENT: record it, because it moves ────────────────
+              # The identical job config produced a good video once and then failed to
+              # compile with the same SBUF error at the same frame count. The repo was
+              # not the variable, so the environment must be. Two suspects: the image is
+              # tagged :latest (a node that pulls fresh gets a different neuronx-cc), and
+              # the logical-NC config (at LNC=2 the per-partition SBUF budget halves, so
+              # an allocation that fit at LNC=1 does not). Print both every run.
+              echo "┌── ENVIRONMENT ──"
+              echo "│ node        : ${NODE_NAME:-unknown}"
+              echo "│ neuronx-cc  : $(neuronx-cc --version 2>&1 | head -1)"
+              echo "│ torch-nx    : $(python3 -c 'import torch_neuronx;print(torch_neuronx.__version__)' 2>&1 | tail -1)"
+              echo "│ torch       : $(python3 -c 'import torch;print(torch.__version__)' 2>&1 | tail -1)"
+              echo "└────────────────"
+              echo "--- neuron-ls (device/core topology, shows LNC) ---"
+              neuron-ls 2>&1 | head -20 || echo "(neuron-ls unavailable)"
+              echo "--- NEURON_RT / LNC env ---"
+              env | grep -E 'NEURON_RT|LOGICAL_NC|NEURON_VISIBLE' | sort || true
+
               cd /tmp/Self-Forcing
               export PYTHONPATH=/tmp/rolling_forcing
 
@@ -209,6 +227,12 @@ spec:
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
+            # So the log names the node it ran on: the same config succeeded on one node
+            # and fails on another.
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             # Which code to run. SF_BRANCH is the branch of yahavb/Self-Forcing
             # holding neuron/; RF_COMMIT pins the Neuron stack.
             - name: SF_BRANCH
