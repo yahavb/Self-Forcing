@@ -180,6 +180,20 @@ spec:
               echo "  Self-Forcing T2V: TP=4 SP=2, ${NUM_OUTPUT_FRAMES} latent frames"
               echo "============================================"
 
+              # ─── Profile ONE forward's 2.95 s ────────────────────────────
+              # 7 fps needs 343 ms per pass; we are at 2950 ms while carrying 1/6 the
+              # tokens of rolling forcing's 750 ms pass. Smaller tensors cannot be
+              # legitimately slower, so ~2.8 s per pass is unexplained. Timing alone has
+              # ruled out DMA (flat as the window grows 3->21 frames) and the dispatch
+              # counts per layer look comparable to rolling forcing's merged path. Look
+              # instead of reasoning. Wiring copied from rolling-forcing-job.yaml:91.
+              if [[ "${SF_PROFILE:-0}" == "1" ]]; then
+                export NEURON_PROFILE_ENABLE=1
+                export NEURON_PROFILE_DIR=/tmp/neuron_profile
+                mkdir -p "$NEURON_PROFILE_DIR"
+                echo "Neuron profiler ON -> $NEURON_PROFILE_DIR"
+              fi
+
               torchrun --nproc_per_node ${NPROC} neuron/sf_inference.py \
                 --prompt_file "${PROMPT_FILE}" \
                 --config_path "${CONFIG_PATH}" \
@@ -192,6 +206,27 @@ spec:
                 --fps "${FPS}" \
                 --max_prompts "${MAX_PROMPTS}" \
                 --use_ema
+
+              # ─── neuron-explorer: where does a pass actually spend 2.95 s ──
+              if [[ "${SF_PROFILE:-0}" == "1" && -d /tmp/neuron_profile ]]; then
+                if [[ -d /tmp/neuron_profile/neffs ]]; then
+                  for d in $(find /tmp/neuron_profile -name "*.ntff" -printf "%h\n" 2>/dev/null | sort -u); do
+                    cp /tmp/neuron_profile/neffs/*.neff "$d/" 2>/dev/null || true
+                  done
+                fi
+                NTFF_DIR=$(find /tmp/neuron_profile -name "*.ntff" -printf "%h\n" 2>/dev/null | head -1)
+                if [[ -n "$NTFF_DIR" ]]; then
+                  echo "=== neuron-explorer summary ==="
+                  neuron-explorer view -d "$NTFF_DIR" --output-format summary-text \
+                    2>&1 | tee /tmp/ne_summary.txt | head -80 || true
+                  neuron-explorer view -d "$NTFF_DIR" --output-format json \
+                    --output-file /tmp/ne_profile.json 2>&1 | tail -3 || true
+                  echo "=== NEFF count (dispatches per pass) ==="
+                  find "$NTFF_DIR" -name '*.neff' | wc -l
+                else
+                  echo "WARNING: profiler produced no .ntff"
+                fi
+              fi
 
               # ─── Archive to PVC ──────────────────────────────────────────
               TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -266,6 +301,10 @@ spec:
             # straggler in a cold compile parks the rest. Unexplained, so not used.
             # Load the 11.4GB T5 and 5.7GB DiT checkpoints in this many waves, so peak
             # host RAM is world/waves instead of world x 17GB.
+            # Profile run: 1 prompt is enough, and set MAX_PROMPTS=1 with it so the
+            # trace covers the traced-and-warm steady state rather than 3 videos.
+            - name: SF_PROFILE
+              value: "1"
             - name: SF_LOAD_WAVES
               value: "4"
             - name: NPROC
@@ -289,7 +328,7 @@ spec:
             # specialisation per distinct attention-window length (7 at 21 frames),
             # prompt 1 reuses them in-process. Prompt 1 is the honest fps.
             - name: MAX_PROMPTS
-              value: "3"
+              value: "2"
             # ─── Neuron runtime (mirrors rolling_forcing's inference jobs).
             # No NEURON_LOGICAL_NC_CONFIG: the resource claim sets LNC.
             - name: NEURON_RT_LOG_LEVEL
