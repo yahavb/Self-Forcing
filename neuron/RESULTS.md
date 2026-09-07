@@ -22,7 +22,34 @@ prompt.** The VAE is 1% of the time and the mp4/PNG writing is outside the block
 timing (as it is in rolling_forcing's own reporting, so the comparison is
 like-for-like).
 
-## Why this is 0.78 and not rolling forcing's 7.8-8.6
+## Control: rolling forcing on the SAME node, same geometry
+
+Run `rf-job-fs1200_20260907_201651`, `rf-job.yaml` unmodified except memory
+250Gi -> 500Gi (it OOMKilled at 256Gi: 16 ranks x 11.4GB T5). Same node, same 16
+ranks, same latent_w 80 / fs1200, same sharded VAE:
+
+```
+DiT-only : median 16.13 fps | max 17.01   (96 blocks)
+DiT+VAE  : median 13.05 fps | max 13.69
+per block: DiT 705-751 ms, VAE ~175 ms
+```
+
+So rolling forcing does **13.05 fps here**, better than the 7.8-8.6 in its own docs,
+and there is no trn2-vs-trn3 excuse. The real gap is 17.7x, not 10x, and it
+decomposes cleanly:
+
+| | RF | SF | ratio |
+|---|---|---|---|
+| DiT per block | 750 ms | 13260 ms | 17.7x |
+| passes per block | 1 x 30 layers | 5 x 30 layers | 5x |
+| per layer-pass | 25.0 ms | 88.4 ms | 3.5x |
+
+**5x is structural** — self-forcing's 4 denoising steps are sequentially dependent
+and cannot be fused. **3.5x is mine** and is fixable. Even fixing all of it caps
+self-forcing at 5 x 25 ms x 30 = 3.8 s/block = **3.2 fps**, against rolling
+forcing's 13. That is the ceiling for this checkpoint's schedule.
+
+## Why the 3.5x per-pass penalty is mine
 
 Attention math is not the bottleneck, and the run proves it: DiT time is flat at
 13.2 s while the KV window grows 7× across the video, and block 0 — the *smallest*
