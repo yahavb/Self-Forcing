@@ -168,12 +168,19 @@ spec:
               # Do not deviate from these four values without a reason better than the
               # one I had.
               #
-              # ─── Run: 16 ranks, TP=4 x SP=4 (as rolling_forcing does) ────
+              # ─── Run: ${NPROC} ranks, TP=4 ──────────────────────────────────
+              # NPROC=16 mirrors rolling_forcing (SP=4). NPROC=8 (SP=2) is the overhead
+              # experiment: at SP=4 each rank holds only 3*1200/4 = 900 query tokens per
+              # forward, small enough that fixed per-dispatch cost should dominate. If
+              # block time barely moves at 8 ranks, then the 2.65 s per forward is
+              # overhead and halving the ranks roughly doubles fps; if block time
+              # doubles, the work is compute-bound after all and 16 is right.
+              # 1200 divides both 8 and 16, so the width does not have to change.
               echo "============================================"
               echo "  Self-Forcing T2V: TP=4 SP=2, ${NUM_OUTPUT_FRAMES} latent frames"
               echo "============================================"
 
-              torchrun --nproc_per_node 16 neuron/sf_inference.py \
+              torchrun --nproc_per_node ${NPROC} neuron/sf_inference.py \
                 --prompt_file "${PROMPT_FILE}" \
                 --config_path "${CONFIG_PATH}" \
                 --checkpoint_path checkpoints/self_forcing_dmd.pt \
@@ -251,6 +258,9 @@ spec:
             # BRING-UP: 6 (2 blocks) while chasing the non-finite pixels — it
             # exercises block 0 (unroped anchor) and block 1 (anchor re-RoPE +
             # carry) at a third of the device time. Restore 21 once clean.
+            # Rank count. 1200 % 8 == 0 and 1200 % 16 == 0, so both are valid here.
+            - name: NPROC
+              value: "8"
             - name: NUM_OUTPUT_FRAMES
               value: "21"
             # Per-call finiteness/magnitude probes, and don't abort on non-finite
