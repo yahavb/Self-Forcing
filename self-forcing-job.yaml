@@ -150,30 +150,30 @@ spec:
               ls -la wan_models/Wan2.1-T2V-1.3B/ checkpoints/
               echo "Model weights ready."
 
-              # ─── This is the configuration that produced a good video ────
-              # Restored verbatim from commit 9cc7382. Do not change more than one
-              # variable at a time from here; four consecutive runs produced nothing
-              # because settings were stacked. What is known:
-              #   6 frames  + unsharded VAE + 480x832  -> good video
-              #   21 frames + unsharded VAE            -> SBUF overflow in the VAE
-              #                                           conv, with the NKI trace
-              #                                           cache both on AND off
-              #   21 frames + sharded VAE + 480x832    -> compiles, pixels are NaN
-              #                                           (13-column shards)
-              #   sharded VAE + 480x640 (10 columns)   -> untested; the run that would
-              #                                           have told us hung on the
-              #                                           collective watchdog first
-              # So the frame count does matter to the unsharded VAE compile, and I do
-              # not have a mechanism for that yet. Anything claiming otherwise in an
-              # earlier revision of this file was wrong.
+              # ─── Mirror rolling_forcing/rf-job.yaml exactly ─────────────
+              # rf-job.yaml runs on this same node-type, this same m-lnc1 claim and this
+              # same image, with: --nproc_per_node=16, TP_DEGREE=4, LATENT_W=80,
+              # CONFIG_PATH=...fs1200. That is the configuration that works here.
               #
-              # ─── Run: 8 ranks, TP=4 x SP=2 ───────────────────────────────
-              # 8 and not 16: frame_seq_length 1560 (480x832) divides 8, not 16.
+              # I originally picked 8 ranks at latent_w=104 (frame_seq_length 1560)
+              # because 1560 is not divisible by 16, and then spent five runs fighting
+              # the consequences. The VAE is what pays for it -- bytes per SBUF partition
+              # for one frame at the decoder's last stage:
+              #   RF: 16 ranks, w=80   ->  40 px/rank ->  38400
+              #   me: 8 ranks,  w=104  -> 104 px/rank ->  99840
+              #   me: unsharded w=104  -> 832 px/rank -> 798720  <- what the compiler
+              #                                                     rejected, every run
+              # 1200 IS divisible by 16, which is exactly why rolling_forcing uses it.
+              #
+              # Do not deviate from these four values without a reason better than the
+              # one I had.
+              #
+              # ─── Run: 16 ranks, TP=4 x SP=4 (as rolling_forcing does) ────
               echo "============================================"
               echo "  Self-Forcing T2V: TP=4 SP=2, ${NUM_OUTPUT_FRAMES} latent frames"
               echo "============================================"
 
-              torchrun --nproc_per_node 8 neuron/sf_inference.py \
+              torchrun --nproc_per_node 16 neuron/sf_inference.py \
                 --prompt_file "${PROMPT_FILE}" \
                 --config_path "${CONFIG_PATH}" \
                 --checkpoint_path checkpoints/self_forcing_dmd.pt \
@@ -291,7 +291,7 @@ spec:
             # rank decodes the full width redundantly. This is both the bisection
             # for the NaN band and a working fallback if the sharded path is broken.
             - name: SF_VAE_SHARD
-              value: "none"
+              value: "world"
             # One PNG per frame in videos_sf/frames/prompt_NNN/, archived to the PVC
             # alongside the mp4.
             - name: SF_SAVE_FRAMES
@@ -305,9 +305,9 @@ spec:
             # CONFIG_PATH and LATENT_W must agree: fs1560 <-> 104 (480x832, native),
             # fs1200 <-> 80 (480x640, the width every RF trn3 job runs).
             - name: CONFIG_PATH
-              value: "neuron/configs/self_forcing_dmd.yaml"
+              value: "neuron/configs/self_forcing_dmd_fs1200.yaml"
             - name: LATENT_W
-              value: "104"
+              value: "80"
             - name: HF_TOKEN
               valueFrom:
                 secretKeyRef:
