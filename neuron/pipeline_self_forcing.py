@@ -7,6 +7,7 @@ is Self-Forcing's.
 """
 
 import os
+import time
 
 import torch
 from omegaconf import OmegaConf
@@ -170,6 +171,12 @@ class SelfForcingInferencePipeline(CausalInferencePipeline):
             for t in steps
         }
 
+        # Per-call timing. 5 syncs per block against a 13 s block is free, and it is
+        # the only way to see whether all five forwards cost the same (fixed dispatch
+        # overhead) or the cache pass / first step dominates.
+        time_calls = os.environ.get("SF_TIME_CALLS", "1") == "1"
+        call_ms = []
+
         debug = os.environ.get("SF_DEBUG_NUMERICS", "0") == "1"
         if debug:
             logger.info("  numerics debug on: warped steps %s -> sigmas %s, "
@@ -189,6 +196,9 @@ class SelfForcingInferencePipeline(CausalInferencePipeline):
                 block_sigma.fill_(sigma_of[call.timestep])
                 if debug:
                     probe(f"b{call.block_index} s{call.step_index} xt_in", block_input)
+                if time_calls:
+                    torch.neuron.synchronize()
+                    _t0 = time.perf_counter()
                 _, pred_x0 = self.generator(
                     noisy_image_or_video=block_input,
                     conditional_dict=conditional_dict,
@@ -202,6 +212,10 @@ class SelfForcingInferencePipeline(CausalInferencePipeline):
                     mode="denoise",
                     updating_cache=True,
                 )
+                if time_calls:
+                    torch.neuron.synchronize()
+                    call_ms.append((call.block_index, f"s{call.step_index}",
+                                    (time.perf_counter() - _t0) * 1000))
                 if debug:
                     probe(f"b{call.block_index} s{call.step_index} pred_x0", pred_x0)
                 if call.renoise_to is not None:
@@ -219,6 +233,9 @@ class SelfForcingInferencePipeline(CausalInferencePipeline):
             block_clean.copy_(pred_x0)
             block_timestep.fill_(call.timestep)
             block_sigma.fill_(self.context_sigma)
+            if time_calls:
+                torch.neuron.synchronize()
+                _t0 = time.perf_counter()
             self.generator(
                 noisy_image_or_video=block_clean,
                 conditional_dict=conditional_dict,
@@ -232,6 +249,15 @@ class SelfForcingInferencePipeline(CausalInferencePipeline):
                 mode="denoise",
                 updating_cache=True,
             )
+            if time_calls:
+                torch.neuron.synchronize()
+                call_ms.append((call.block_index, "cache",
+                                (time.perf_counter() - _t0) * 1000))
+                per = [f"{k} {v:7.1f}" for b, k, v in call_ms
+                       if b == call.block_index]
+                logger.info("    b%d calls: %s ms  (window %d frames)",
+                            call.block_index, "  ".join(per),
+                            call.start_frame + nfpb)
             if debug:
                 probe(f"b{call.block_index} clean_latent", block_clean)
                 for i in (0, self.num_transformer_blocks // 2,
