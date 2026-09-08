@@ -303,6 +303,12 @@ spec:
             # host RAM is world/waves instead of world x 17GB.
             # Profile run: 1 prompt is enough, and set MAX_PROMPTS=1 with it so the
             # trace covers the traced-and-warm steady state rather than 3 videos.
+            # Profiling run. NUM_OUTPUT_FRAMES=3 is ONE block = 5 passes, so the device
+            # trace stays under the limit that killed the last one: profiling a whole
+            # 21-frame prompt queued 48537 executions and only 15565 survived, which
+            # produced a NEFF/NTFF mismatch and no per-op timings. One warm block gives
+            # ~7000 and should yield a valid trace naming the op behind the 159
+            # host-to-device copy-ins per layer.
             - name: SF_PROFILE
               value: "1"
             - name: SF_LOAD_WAVES
@@ -310,7 +316,7 @@ spec:
             - name: NPROC
               value: "16"
             - name: NUM_OUTPUT_FRAMES
-              value: "21"
+              value: "3"
             # Per-call finiteness/magnitude probes, and don't abort on non-finite
             # pixels so one run localizes the problem. Set to "0" for real runs.
             # MUST be 0 for any run whose fps is quoted. The probes sync the device inside
