@@ -141,6 +141,42 @@ def parse_args():
     return p.parse_args()
 
 
+def start_neuron_profiler(rank):
+    """Native Neuron profiler, verbatim from rolling_forcing/e2e_pipeline.py:155-179.
+
+    NEURON_PROFILE_ENABLE=1 on its own does nothing -- the profiler has to be
+    constructed in code, which is why the previous run produced no .ntff. Returns the
+    live context manager, or None.
+    """
+    if os.environ.get("NEURON_PROFILE_ENABLE", "0") != "1":
+        return None
+    profile_dir = os.environ.get("NEURON_PROFILE_DIR", "/tmp/neuron_profile")
+    try:
+        from torch.profiler import profile as torch_profile, ProfilerActivity
+        from torch_neuronx.profiling import NeuronConfig, ProfileMode, NeuronProfiler
+        os.makedirs(profile_dir, exist_ok=True)
+        neuron_config = NeuronConfig(
+            modes=[ProfileMode.DEVICE, ProfileMode.RUNTIME],
+            profile_output_dir=profile_dir,
+            neff_cache_dir=os.environ.get(
+                "TORCH_NEURONX_NEFF_CACHE_DIR", "/tmp/neff_cache"),
+        )
+        exporter = NeuronProfiler(neuron_config)
+        prof = torch_profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1],
+            experimental_config=neuron_config,
+            on_trace_ready=exporter.export_trace,
+        )
+        prof.__enter__()
+        if rank == 0:
+            logger.info("Neuron profiler started -> %s", profile_dir)
+        return prof
+    except Exception as e:
+        if rank == 0:
+            logger.warning("Could not start native profiler: %s", e)
+        return None
+
+
 def staggered(rank, world, waves, fn):
     """Run fn on a fraction of the ranks at a time, so host RAM peak is world/waves.
 
@@ -293,8 +329,15 @@ def main():
 
     timings = []
 
+    # Profile one warm prompt, not prompt 0: prompt 0 traces every kernel, which both
+    # bloats the trace and hides the steady state we are trying to explain.
+    profile_prompt = int(os.environ.get("SF_PROFILE_PROMPT", "1"))
+    profiler = None
+
     for prompt_idx, prompt in enumerate(prompts):
         logger.info("[prompt %3d/%d] %s...", prompt_idx, len(prompts), prompt[:70])
+        if prompt_idx == profile_prompt:
+            profiler = start_neuron_profiler(rank)
 
         noise = torch.randn(
             1, args.num_output_frames, 16, args.latent_h, args.latent_w,
@@ -323,6 +366,13 @@ def main():
             if not DEBUG_NUMERICS:
                 raise AssertionError(msg)
             logger.warning("%s (continuing: SF_DEBUG_NUMERICS=1)", msg)
+
+        if profiler is not None:
+            torch.neuron.synchronize()
+            profiler.__exit__(None, None, None)
+            profiler = None
+            if rank == 0:
+                logger.info("Neuron profiler stopped after prompt %d", prompt_idx)
 
         full = gather_full_video(video_local, rank, world)
         if rank == 0:
