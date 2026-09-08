@@ -96,3 +96,39 @@ steps across blocks *is* what rolling forcing added.
 
 Not a lever: the VAE (1% of time), T5 (24 ms), or the on-disk compile caches
 (steady-state execution is unaffected).
+
+## Profile: the cost is host-side dispatch churn, not math
+
+Run `bb62233` with `SF_PROFILE=1`, profiling one warm prompt (35 passes = 7 blocks x 5
+forwards, 1050 layer-executions). The device trace was dropped (`NEFF/NTFF mismatch`,
+15565 of 48537 executions) so there are no per-op timings, but the CPU-side event
+counts are decisive:
+
+| event | total | per pass | per layer |
+|---|---|---|---|
+| `dmem_buf_copyin` | 167435 | 4784 | **159** |
+| `neuron::alloc::lazy` | 110080 | 3145 | 105 |
+| `aten::contiguous` | 27214 | 778 | 26 |
+| `event_signal` | 9064 | 259 | 9 |
+| `kbl_exec_post` | 7936 | 227 | 8 |
+
+4784 host-to-device copy-ins per pass at ~0.5 ms each is ~2.4 s, essentially the whole
+2.8 s of per-pass cost that attention, DMA volume and the schedule could not explain.
+159 copy-ins and 105 lazy allocations for a single transformer layer is churn, not
+work.
+
+This also corrects an earlier claim in this file: 5-passes-vs-1 is **not** the binding
+constraint. Self-forcing pushes 18000 query tokens per block against rolling forcing's
+21600 -- less work -- so at equal per-frame efficiency this schedule would run at ~19
+fps. The gap is entirely per-pass overhead.
+
+### The open question
+
+Does rolling forcing show the same per-layer churn? Its job carries the same profiler
+wiring, so this is answerable with their code and no changes of mine:
+
+- if RF is also ~4784 copy-ins per pass, the overhead is inherent to the stack and the
+  only lever is passes per block, which is the schedule
+- if RF is ~200 per pass, something in this port's path (`mode="denoise"` with
+  `updating_cache=True`, versus RF's fused `merged`) is generating the churn, and it is
+  fixable
