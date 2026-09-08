@@ -310,13 +310,18 @@ spec:
             # ~7000 and should yield a valid trace naming the op behind the 159
             # host-to-device copy-ins per layer.
             - name: SF_PROFILE
+              value: "0"
+            # A/B the _attend patch: 1 transposes only the used window, 0 restores
+            # rolling_forcing's behaviour of transposing all 32768 padded tokens per
+            # layer per call. Expect ~1.75x less transpose work on average.
+            - name: SF_ATTEND_SLICE
               value: "1"
             - name: SF_LOAD_WAVES
               value: "4"
             - name: NPROC
               value: "16"
             - name: NUM_OUTPUT_FRAMES
-              value: "3"
+              value: "21"
             # Per-call finiteness/magnitude probes, and don't abort on non-finite
             # pixels so one run localizes the problem. Set to "0" for real runs.
             # MUST be 0 for any run whose fps is quoted. The probes sync the device inside

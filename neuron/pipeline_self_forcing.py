@@ -23,6 +23,67 @@ from schedule import CACHE, DENOISE, sf_schedule
 logger = get_logger(__name__)
 
 
+def install_sliced_attend():
+    """Stop transposing 25 MB of padding per layer per call.
+
+    rolling_forcing's _attend does:
+
+        k_kern = buffer_k[0].permute(1, 2, 0).contiguous()
+        v_kern = buffer_v[0].permute(1, 0, 2).contiguous()
+
+    The shared buffer is padded to 32768 tokens, so that is a strided transpose of
+    25 MB for k and 25 MB for v -- 50 MB per layer, 1.5 GB per pass -- and it copies
+    the FULL padded width no matter how small actual_seqlen_k is. That is why our
+    per-pass time is flat at ~2.95 s whether the attention window holds 3 frames or
+    21: the transpose dominates and does not depend on the window.
+
+    Rolling forcing pays this once per block; self-forcing's 5 sequential passes pay
+    it five times (7.55 GB vs 1.51 GB per block).
+
+    The fix is to transpose only as much of the buffer as the kernel will actually
+    read, rounded up to ATTN_SEQLEN_MULTIPLE so the kernel's own assert still holds.
+    Numerics are unchanged: the kernel already masks everything past actual_seqlen_k,
+    and the tail we now skip copying was masked-out padding.
+
+    Installed as a method patch rather than a fork so rolling_forcing stays untouched.
+    """
+    from models.dit_attention import CausalWanSelfAttention
+    from models.dit_layers import ATTN_SEQLEN_MULTIPLE
+    from kernels.self_attention import wan_flash_self_attn
+
+    original = CausalWanSelfAttention._attend
+
+    def _attend_sliced(self, roped_query, shared_buffers, k_len_int):
+        if os.environ.get("RF_RING", "0") == "1":
+            return original(self, roped_query, shared_buffers, k_len_int)
+
+        buffer_k, buffer_v = shared_buffers
+        width = ((k_len_int + ATTN_SEQLEN_MULTIPLE - 1)
+                 // ATTN_SEQLEN_MULTIPLE) * ATTN_SEQLEN_MULTIPLE
+
+        q_kern = roped_query[0].permute(1, 2, 0).contiguous()
+        k_kern = buffer_k[0, :width].permute(1, 2, 0).contiguous()
+        v_kern = buffer_v[0, :width].permute(1, 0, 2).contiguous()
+
+        assert k_kern.shape[2] % ATTN_SEQLEN_MULTIPLE == 0
+        assert v_kern.shape[1] % ATTN_SEQLEN_MULTIPLE == 0
+
+        out = wan_flash_self_attn(
+            q_kern, k_kern, v_kern,
+            softmax_scale=self.softmax_scale,
+            actual_seqlen_k=k_len_int,
+            use_dynamic_loop=False,
+        )
+        return out.unsqueeze(0).flatten(2)
+
+    CausalWanSelfAttention._attend = _attend_sliced
+    logger.info("patched _attend: transposing only the used window, not 32768 tokens")
+
+
+if os.environ.get("SF_ATTEND_SLICE", "1") == "1":
+    install_sliced_attend()
+
+
 def probe(tag, t):
     """Log finiteness and magnitude of a device tensor. Forces a sync — only call
     under SF_DEBUG_NUMERICS=1.
